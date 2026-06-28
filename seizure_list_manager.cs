@@ -260,6 +260,53 @@ public static class BusinessLogic
         return era.Name + year + "年" + month + "月" + day + "日";
     }
 
+    // DateTime → 7桁和暦変換（era_mapping.json 使用）
+    // 西暦年が最も近い元号を逆引き（降順で最初にマッチしたもの）
+    public static string DateToWareki(DateTime date, Dictionary<int, EraEntry> eraMap)
+    {
+        foreach (var pair in eraMap.OrderByDescending(p => p.Value.StartYear))
+        {
+            if (date.Year >= pair.Value.StartYear)
+            {
+                int warekiYear = date.Year - pair.Value.StartYear + 1;
+                return string.Format("{0}{1:D2}{2:D2}{3:D2}",
+                    pair.Key, warekiYear, date.Month, date.Day);
+            }
+        }
+        return "";
+    }
+
+    // 柔軟な日付入力パース（7桁和暦, yyyy/MM/dd, yyyyMMdd に対応）
+    public static DateTime? ParseFlexibleDate(string input, Dictionary<int, EraEntry> eraMap)
+    {
+        if (string.IsNullOrWhiteSpace(input)) return null;
+        input = input.Trim();
+
+        // スラッシュ区切り（yyyy/MM/dd or yyyy/M/d）
+        if (input.Contains("/"))
+        {
+            DateTime dt;
+            if (DateTime.TryParse(input, out dt)) return dt;
+            return null;
+        }
+
+        // 7桁和暦
+        if (input.Length == 7 && input.All(char.IsDigit))
+            return WarekiToDate(input, eraMap);
+
+        // 8桁西暦（yyyyMMdd）
+        if (input.Length == 8 && input.All(char.IsDigit))
+        {
+            DateTime dt;
+            if (DateTime.TryParseExact(input, "yyyyMMdd",
+                System.Globalization.CultureInfo.InvariantCulture,
+                System.Globalization.DateTimeStyles.None, out dt))
+                return dt;
+        }
+
+        return null;
+    }
+
     // 登録日時を表示形式に変換（"2026/06/25 14:32:05" → "06/25 14:32"）
     public static string FormatDisplayDateTime(string rawDateTime)
     {
@@ -314,12 +361,20 @@ public class SeizureListManagerApp : Application
     private const int I_COL_FLAG2        = 19;
     private const int I_MIN_COLUMNS      = 21;
 
+    // 編集対象列（預金・生保共通）
+    private const int EDIT_COL_NAME         = 2;
+    private const int EDIT_COL_STAFF        = 3;
+    private const int EDIT_COL_EXEC_DATE    = 4;
+    private const int EDIT_COL_RESIDENCE    = 5;
+    private const int EDIT_COL_DELIVERY     = 6;
+
     // --- 状態 ---
     private bool isDepositTab = true;                      // 現在のアクティブタブ（true=預金）
     private string currentSortColumn = "文書番号";          // 現在のソート列
     private bool currentSortAsc = false;                   // 昇順ソートか
     private bool hideWithdrawn = false;                    // 引抜済み非表示トグル
     private System.Windows.Threading.DispatcherTimer filterTimer;  // 即時フィルタのデバウンス用
+    private CsvRecord editingRecord = null;                // 編集中のレコード（null=未編集）
 
     // --- キャッシュ済みブラシ ---
     // 毎回 new SolidColorBrush するとGC負荷が増えるため、
@@ -352,10 +407,21 @@ public class SeizureListManagerApp : Application
     private ComboBox columnCombo;
     private CheckBox toggleWithdrawn;
     private ListView dataTable;
-    private Button btnWithdraw, btnReload, btnClear, confirmCancel;
+    private Button btnWithdraw, btnEdit, btnReload, btnClear, confirmCancel;
     private TextBlock statusLeft, statusRight;
     private Grid confirmOverlay;
     private TextBlock confirmMessage, confirmSub;
+
+    // --- 編集オーバーレイ UI要素 ---
+    private Grid editOverlay;
+    private TextBox editName, editStaff, editExecDate, editResidence, editDelivery;
+    private TextBox editAddrNum, editInstitution;
+    private TextBlock editError;
+    private Button editSave;
+    private CheckBox editChkDelivery;
+    private TextBlock editDeliveryError;
+    private Popup editCalendarPopup;
+    private System.Windows.Controls.Calendar editCalendar;
 
     // ==============================================================
     // エントリポイント
@@ -737,6 +803,21 @@ public class SeizureListManagerApp : Application
                 </ControlTemplate>
             </Setter.Value></Setter>
         </Style>
+
+        <!-- TextBox: 編集オーバーレイ用（角丸 + Padding伝播、deposit_seizure_list と統一） -->
+        <Style x:Key='ET' TargetType='TextBox'>
+            <Setter Property='Foreground' Value='#333'/>
+            <Setter Property='Template'><Setter.Value>
+                <ControlTemplate TargetType='TextBox'>
+                    <Border Background='{TemplateBinding Background}'
+                            BorderBrush='{TemplateBinding BorderBrush}'
+                            BorderThickness='{TemplateBinding BorderThickness}'
+                            CornerRadius='4' Padding='{TemplateBinding Padding}'
+                            SnapsToDevicePixels='True'>
+                        <ScrollViewer x:Name='PART_ContentHost' Focusable='False'/></Border>
+                </ControlTemplate>
+            </Setter.Value></Setter>
+        </Style>
     </Window.Resources>
 
     <DockPanel>
@@ -875,6 +956,11 @@ public class SeizureListManagerApp : Application
                         Style='{StaticResource AB}' IsEnabled='False'>
                     <TextBlock Text='&#x2193; 引抜' VerticalAlignment='Center'
                                Padding='0,0,4,0'/>
+                </Button>
+                <Button x:Name='EditButton' DockPanel.Dock='Right'
+                        Style='{StaticResource GB}' IsEnabled='False'
+                        Margin='0,0,8,0'>
+                    <TextBlock Text='&#x270E; 編集' VerticalAlignment='Center'/>
                 </Button>
                 <CheckBox x:Name='ToggleWithdrawn'
                           Content='引抜済みを非表示' FontSize='11'
@@ -1036,6 +1122,115 @@ public class SeizureListManagerApp : Application
                     </StackPanel>
                 </Border>
             </Grid>
+
+            <!-- 編集オーバーレイ -->
+            <Grid x:Name='EditOverlay' Visibility='Collapsed' Opacity='0'
+                  Background='#CCFFFFFF'>
+                <Border Background='White' CornerRadius='8'
+                        Padding='28,24' Width='580'
+                        HorizontalAlignment='Center' VerticalAlignment='Center'>
+                    <Border.Effect><DropShadowEffect BlurRadius='16' ShadowDepth='4' Opacity='0.12'/></Border.Effect>
+                    <StackPanel>
+                        <!-- タイトル + ✕ボタン -->
+                        <DockPanel Margin='0,0,0,14'>
+                            <Button x:Name='EditCloseButton' DockPanel.Dock='Right'
+                                    Cursor='Hand' Focusable='False'
+                                    VerticalAlignment='Top' Margin='0,-4,-4,0'>
+                                <Button.Template>
+                                    <ControlTemplate TargetType='Button'>
+                                        <Border x:Name='ecbg' Width='24' Height='24'
+                                                CornerRadius='4' Background='Transparent'>
+                                            <TextBlock Text='&#x2715;' FontSize='13'
+                                                       Foreground='#999'
+                                                       HorizontalAlignment='Center'
+                                                       VerticalAlignment='Center'/>
+                                        </Border>
+                                        <ControlTemplate.Triggers>
+                                            <Trigger Property='IsMouseOver' Value='True'>
+                                                <Setter TargetName='ecbg' Property='Background' Value='#F0F0F0'/>
+                                            </Trigger>
+                                        </ControlTemplate.Triggers>
+                                    </ControlTemplate>
+                                </Button.Template>
+                            </Button>
+                            <TextBlock Text='&#x270E; 登録内容の編集' FontSize='13' FontWeight='Medium'/>
+                        </DockPanel>
+                        <!-- 読取専用フィールド: 宛名番号 + 金融機関名 -->
+                        <Grid Margin='0,0,0,10'>
+                            <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='16'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
+                            <StackPanel Grid.Column='0'>
+                                <TextBlock Text='宛名番号' FontSize='11' Foreground='#777' Margin='0,0,0,3'/>
+                                <TextBox x:Name='EditAddrNum' Style='{StaticResource ET}' IsReadOnly='True' Background='#F3F3F3'
+                                         BorderBrush='#E8E8E8' FontSize='12' FontFamily='Consolas' Padding='5,4'/>
+                            </StackPanel>
+                            <StackPanel Grid.Column='2'>
+                                <TextBlock Text='金融機関名' FontSize='11' Foreground='#777' Margin='0,0,0,3'/>
+                                <TextBox x:Name='EditInstitution' Style='{StaticResource ET}' IsReadOnly='True' Background='#F3F3F3'
+                                         BorderBrush='#E8E8E8' FontSize='12' Padding='5,4'/>
+                            </StackPanel>
+                        </Grid>
+                        <!-- 編集フィールド: 氏名 + 処分担当 -->
+                        <Grid Margin='0,0,0,10'>
+                            <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='16'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
+                            <StackPanel Grid.Column='0'>
+                                <TextBlock FontSize='11' Foreground='#777' Margin='0,0,0,3'>氏名 &#x270E;</TextBlock>
+                                <TextBox x:Name='EditName' Style='{StaticResource ET}' FontSize='12' Padding='5,4' BorderBrush='#D0D0D0'/>
+                            </StackPanel>
+                            <StackPanel Grid.Column='2'>
+                                <TextBlock FontSize='11' Foreground='#777' Margin='0,0,0,3'>処分担当 &#x270E;</TextBlock>
+                                <TextBox x:Name='EditStaff' Style='{StaticResource ET}' FontSize='12' Padding='5,4' BorderBrush='#D0D0D0'/>
+                            </StackPanel>
+                        </Grid>
+                        <!-- 住民票住所 -->
+                        <StackPanel Margin='0,0,0,10'>
+                            <TextBlock FontSize='11' Foreground='#777' Margin='0,0,0,3'>住民票住所 &#x270E;</TextBlock>
+                            <TextBox x:Name='EditResidence' Style='{StaticResource ET}' FontSize='12' Padding='5,4' BorderBrush='#D0D0D0'/>
+                        </StackPanel>
+                        <!-- 届出住所 + 出力チェック -->
+                        <StackPanel Margin='0,0,0,10'>
+                            <TextBlock FontSize='11' Foreground='#777' Margin='0,0,0,3'>届出住所 &#x270E;</TextBlock>
+                            <TextBox x:Name='EditDelivery' Style='{StaticResource ET}' FontSize='12' Padding='5,4' BorderBrush='#D0D0D0'/>
+                            <TextBlock x:Name='EditDeliveryError' Foreground='#D32F2F' FontSize='10'
+                                       Visibility='Collapsed' Margin='0,1,0,0'/>
+                            <CheckBox x:Name='EditChkDelivery'
+                                      Content='届出住所を差押通知書に出力する'
+                                      FontSize='12' Margin='0,4,0,0'/>
+                        </StackPanel>
+                        <!-- 執行日 + カレンダーPopup -->
+                        <StackPanel Margin='0,0,0,16'>
+                            <TextBlock FontSize='11' Foreground='#777' Margin='0,0,0,3'>執行日 &#x270E;</TextBlock>
+                            <StackPanel Orientation='Horizontal'>
+                                <TextBox x:Name='EditExecDate' Style='{StaticResource ET}' FontSize='12' Padding='5,4'
+                                         BorderBrush='#D0D0D0' FontFamily='Consolas' Width='120'/>
+                                <Button x:Name='EditCalendarButton' Style='{StaticResource GB}'
+                                        Padding='6,4' Margin='4,0,0,0'>
+                                    <TextBlock Text='&#x1F4C5;' FontSize='13'/></Button>
+                                <Popup x:Name='EditCalendarPopup' StaysOpen='False'
+                                       Placement='Bottom' AllowsTransparency='True'>
+                                    <Border Background='White' BorderBrush='#D0D0D0'
+                                            BorderThickness='1' CornerRadius='6'
+                                            Padding='8' Margin='0,4,0,0'>
+                                        <Border.Effect><DropShadowEffect BlurRadius='12' ShadowDepth='3' Opacity='0.15'/></Border.Effect>
+                                        <Calendar x:Name='EditCalendar' SelectionMode='SingleDate'/>
+                                    </Border>
+                                </Popup>
+                            </StackPanel>
+                        </StackPanel>
+                        <!-- バリデーション + ボタン -->
+                        <DockPanel>
+                            <StackPanel DockPanel.Dock='Right' Orientation='Horizontal'>
+                                <Button x:Name='EditCancelButton' Content='キャンセル'
+                                        Style='{StaticResource GB}' Margin='0,0,8,0'/>
+                                <Button x:Name='EditSaveButton' Content='保存'
+                                        Style='{StaticResource AB}'/>
+                            </StackPanel>
+                            <TextBlock x:Name='EditError' FontSize='11'
+                                       Foreground='#D32F2F' VerticalAlignment='Center'
+                                       TextWrapping='Wrap'/>
+                        </DockPanel>
+                    </StackPanel>
+                </Border>
+            </Grid>
         </Grid>
     </DockPanel>
 </Window>";
@@ -1060,6 +1255,7 @@ public class SeizureListManagerApp : Application
         toggleWithdrawn = (CheckBox)window.FindName("ToggleWithdrawn");
         dataTable       = (ListView)window.FindName("DataTable");
         btnWithdraw     = (Button)window.FindName("WithdrawButton");
+        btnEdit         = (Button)window.FindName("EditButton");
         btnReload       = (Button)window.FindName("ReloadButton");
         btnClear        = (Button)window.FindName("ClearButton");
         statusLeft      = (TextBlock)window.FindName("StatusLeft");
@@ -1068,6 +1264,22 @@ public class SeizureListManagerApp : Application
         confirmMessage  = (TextBlock)window.FindName("ConfirmMessage");
         confirmSub      = (TextBlock)window.FindName("ConfirmSub");
         confirmCancel   = (Button)window.FindName("ConfirmCancel");
+
+        // 編集オーバーレイ
+        editOverlay     = (Grid)window.FindName("EditOverlay");
+        editAddrNum     = (TextBox)window.FindName("EditAddrNum");
+        editInstitution = (TextBox)window.FindName("EditInstitution");
+        editName        = (TextBox)window.FindName("EditName");
+        editStaff       = (TextBox)window.FindName("EditStaff");
+        editResidence   = (TextBox)window.FindName("EditResidence");
+        editDelivery    = (TextBox)window.FindName("EditDelivery");
+        editChkDelivery = (CheckBox)window.FindName("EditChkDelivery");
+        editDeliveryError = (TextBlock)window.FindName("EditDeliveryError");
+        editExecDate    = (TextBox)window.FindName("EditExecDate");
+        editError       = (TextBlock)window.FindName("EditError");
+        editSave        = (Button)window.FindName("EditSaveButton");
+        editCalendarPopup = (Popup)window.FindName("EditCalendarPopup");
+        editCalendar    = (System.Windows.Controls.Calendar)window.FindName("EditCalendar");
     }
 
     // イベントハンドラの登録
@@ -1118,10 +1330,87 @@ public class SeizureListManagerApp : Application
         // 引抜ボタン
         btnWithdraw.Click += delegate { ShowConfirmOverlay(); };
 
+        // 編集ボタン
+        btnEdit.Click += delegate { ShowEditOverlay(); };
+
+        // テーブルダブルクリック → 編集オーバーレイ表示（データ行のみ）
+        dataTable.MouseDoubleClick += delegate(object s, MouseButtonEventArgs me)
+        {
+            // VisualTree を辿り、ListViewItem 上のクリックか確認する
+            DependencyObject hit = me.OriginalSource as DependencyObject;
+            while (hit != null && !(hit is ListViewItem))
+                hit = VisualTreeHelper.GetParent(hit);
+            if (hit != null && HasEditableSelection()) ShowEditOverlay();
+        };
+
         // 確認オーバーレイのボタン
         var confirmExecute = (Button)window.FindName("ConfirmExecute");
-        confirmCancel.Click += delegate { FadeOutOverlay(delegate { dataTable.Focus(); }); };
+        confirmCancel.Click += delegate { FadeOut(confirmOverlay, delegate { dataTable.Focus(); }); };
         confirmExecute.Click += delegate { ExecuteWithdrawal(); };
+
+        // 編集オーバーレイのボタン
+        var editClose = (Button)window.FindName("EditCloseButton");
+        var editCancel = (Button)window.FindName("EditCancelButton");
+        editClose.Click += delegate { CloseEditOverlay(); };
+        editCancel.Click += delegate { CloseEditOverlay(); };
+        editSave.Click += delegate { SaveEdit(); };
+
+        // 届出住所バリデーション
+        editDelivery.TextChanged += delegate { ValidateEditDelivery(); };
+        editChkDelivery.Checked += delegate { ValidateEditDelivery(); };
+        editChkDelivery.Unchecked += delegate { ValidateEditDelivery(); };
+
+        // 編集オーバーレイの執行日入力 → LostFocus で yyyy/MM/dd に正規化
+        editExecDate.LostFocus += delegate
+        {
+            var input = editExecDate.Text.Trim();
+            if (string.IsNullOrEmpty(input)) return;
+            var dt = BusinessLogic.ParseFlexibleDate(input, eraMapping);
+            if (dt.HasValue)
+            {
+                editExecDate.Text = dt.Value.ToString("yyyy/MM/dd");
+                editExecDate.BorderBrush = BrushBorderNormal;
+            }
+            else
+            {
+                editExecDate.BorderBrush = BrushError;
+            }
+        };
+
+        // 編集オーバーレイのカレンダーボタン
+        var editCalBtn = (Button)window.FindName("EditCalendarButton");
+        editCalBtn.Click += delegate
+        {
+            editCalendarPopup.PlacementTarget = editCalBtn;
+            if (!editCalendarPopup.IsOpen)
+            {
+                editCalendar.DisplayMode = CalendarMode.Month;
+                var dt = BusinessLogic.ParseFlexibleDate(editExecDate.Text.Trim(), eraMapping);
+                editCalendar.DisplayDate = dt ?? DateTime.Today;
+                editCalendar.SelectedDates.Clear();
+            }
+            editCalendarPopup.IsOpen = !editCalendarPopup.IsOpen;
+        };
+        editCalendar.SelectedDatesChanged += delegate
+        {
+            if (editCalendar.SelectedDate.HasValue)
+            {
+                editExecDate.Text = editCalendar.SelectedDate.Value.ToString("yyyy/MM/dd");
+                editExecDate.BorderBrush = BrushBorderNormal;
+                editCalendarPopup.IsOpen = false;
+            }
+        };
+
+        // 編集オーバーレイの空白クリックでテキストボックスからフォーカスを外す
+        editOverlay.MouseDown += delegate(object s, MouseButtonEventArgs me)
+        {
+            if (me.OriginalSource is System.Windows.Controls.Panel ||
+                me.OriginalSource is Border)
+            {
+                FocusManager.SetFocusedElement(window, editOverlay);
+                Keyboard.ClearFocus();
+            }
+        };
 
         // 再読み込みボタン
         btnReload.Click += delegate { ReloadCurrentTab(); };
@@ -1131,11 +1420,15 @@ public class SeizureListManagerApp : Application
 
         // コンテキストメニュー
         var ctxMenu = new ContextMenu();
+        var ctxEdit = new MenuItem { Header = "編集" };
+        ctxEdit.Click += delegate { ShowEditOverlay(); };
+        ctxMenu.Items.Add(ctxEdit);
         var ctxWithdraw = new MenuItem { Header = "引抜" };
         ctxWithdraw.Click += delegate { ShowConfirmOverlay(); };
         ctxMenu.Items.Add(ctxWithdraw);
         ctxMenu.Opened += delegate
         {
+            ctxEdit.IsEnabled = HasEditableSelection();
             ctxWithdraw.IsEnabled = HasWithdrawableSelection();
         };
         dataTable.ContextMenu = ctxMenu;
@@ -1147,6 +1440,12 @@ public class SeizureListManagerApp : Application
         window.InputBindings.Add(new KeyBinding(
             new RelayCommand(delegate { searchBox.Focus(); searchBox.SelectAll(); }),
             new KeyGesture(Key.F, ModifierKeys.Control)));
+        window.InputBindings.Add(new KeyBinding(
+            new RelayCommand(delegate
+            {
+                if (editOverlay.Visibility == Visibility.Visible) CloseEditOverlay();
+            }),
+            new KeyGesture(Key.Escape)));
     }
 
     // UI の初期状態を設定
@@ -1371,13 +1670,14 @@ public class SeizureListManagerApp : Application
     }
 
     // ==============================================================
-    // 引抜操作
+    // 引抜・編集操作
     // ==============================================================
 
-    // 引抜ボタンの有効/無効を更新する
+    // 引抜・編集ボタンの有効/無効を更新する
     private void UpdateButtonState()
     {
         btnWithdraw.IsEnabled = HasWithdrawableSelection();
+        btnEdit.IsEnabled = HasEditableSelection();
     }
 
     // 選択行に引抜可能な行が含まれているか
@@ -1389,6 +1689,14 @@ public class SeizureListManagerApp : Application
             if (rec != null && !rec.IsWithdrawn) return true;
         }
         return false;
+    }
+
+    // 引抜済みでない行が1件だけ選択されているか（編集の有効条件）
+    private bool HasEditableSelection()
+    {
+        if (dataTable.SelectedItems.Count != 1) return false;
+        var rec = dataTable.SelectedItems[0] as CsvRecord;
+        return rec != null && !rec.IsWithdrawn;
     }
 
     // 引抜確認オーバーレイを表示する
@@ -1410,7 +1718,7 @@ public class SeizureListManagerApp : Application
         else
             confirmMessage.Text = targets.Count + " 件の登録を引き抜きます";
 
-        FadeInOverlay();
+        FadeIn(confirmOverlay);
         confirmCancel.Focus();
     }
 
@@ -1423,14 +1731,14 @@ public class SeizureListManagerApp : Application
             var rec = item as CsvRecord;
             if (rec != null && !rec.IsWithdrawn) targets.Add(rec);
         }
-        if (targets.Count == 0) { FadeOutOverlay(); return; }
+        if (targets.Count == 0) { FadeOut(confirmOverlay); return; }
 
         var lineIndices = targets.Select(r => r.OriginalLineIndex).ToList();
         string csvPath = isDepositTab ? depositCsvPath : insuranceCsvPath;
 
         bool success = WriteWithdrawalFlags(csvPath, lineIndices, isDepositTab);
 
-        FadeOutOverlay(delegate
+        FadeOut(confirmOverlay, delegate
         {
             if (success)
             {
@@ -1453,31 +1761,262 @@ public class SeizureListManagerApp : Application
     }
 
     // ==============================================================
+    // 編集操作
+    // ==============================================================
+
+    // 編集オーバーレイを表示し、選択行のデータをフォームに反映する
+    private void ShowEditOverlay()
+    {
+        if (!HasEditableSelection()) return;
+
+        editingRecord = dataTable.SelectedItems[0] as CsvRecord;
+        if (editingRecord == null) return;
+
+        // 読取専用フィールド
+        editAddrNum.Text = editingRecord.AddressNumber;
+        editInstitution.Text = editingRecord.InstitutionName;
+
+        // 編集対象フィールド（CSV の生値を表示）
+        var fields = editingRecord.RawFields;
+        editName.Text = fields.Length > EDIT_COL_NAME ? fields[EDIT_COL_NAME].Trim() : "";
+        editStaff.Text = fields.Length > EDIT_COL_STAFF ? fields[EDIT_COL_STAFF].Trim() : "";
+        editResidence.Text = fields.Length > EDIT_COL_RESIDENCE ? fields[EDIT_COL_RESIDENCE].Trim() : "";
+
+        // 届出住所: CSV の「（届出：...）」ラッパーを解析してチェック状態を判定
+        var rawDelivery = fields.Length > EDIT_COL_DELIVERY ? fields[EDIT_COL_DELIVERY].Trim() : "";
+        if (rawDelivery.StartsWith("（届出：") && rawDelivery.EndsWith("）"))
+        {
+            editDelivery.Text = rawDelivery.Substring(4, rawDelivery.Length - 5);
+            editChkDelivery.IsChecked = true;
+        }
+        else
+        {
+            editDelivery.Text = rawDelivery;
+            editChkDelivery.IsChecked = !string.IsNullOrEmpty(rawDelivery);
+        }
+        editDeliveryError.Visibility = Visibility.Collapsed;
+
+        // 執行日: 7桁和暦 → yyyy/MM/dd に変換して表示
+        var rawExec = fields.Length > EDIT_COL_EXEC_DATE ? fields[EDIT_COL_EXEC_DATE].Trim() : "";
+        var execDt = BusinessLogic.ParseFlexibleDate(rawExec, eraMapping);
+        editExecDate.Text = execDt.HasValue ? execDt.Value.ToString("yyyy/MM/dd") : rawExec;
+
+        // バリデーション状態のリセット
+        editError.Text = "";
+        editName.BorderBrush = BrushBorderNormal;
+        editStaff.BorderBrush = BrushBorderNormal;
+        editExecDate.BorderBrush = BrushBorderNormal;
+        editResidence.BorderBrush = BrushBorderNormal;
+
+        FadeIn(editOverlay);
+        editName.Focus();
+    }
+
+    // 編集オーバーレイを閉じる（変更を破棄）
+    private void CloseEditOverlay()
+    {
+        editingRecord = null;
+        editCalendarPopup.IsOpen = false;
+        FadeOut(editOverlay, delegate { dataTable.Focus(); });
+    }
+
+    // バリデーションを実行し、エラーメッセージを返す（正常時は null）
+    private string ValidateEditFields()
+    {
+        if (string.IsNullOrWhiteSpace(editName.Text))
+        {
+            editName.BorderBrush = BrushError;
+            return "氏名を入力してください";
+        }
+        if (string.IsNullOrWhiteSpace(editStaff.Text))
+        {
+            editStaff.BorderBrush = BrushError;
+            return "処分担当を入力してください";
+        }
+        if (string.IsNullOrWhiteSpace(editResidence.Text))
+        {
+            editResidence.BorderBrush = BrushError;
+            return "住民票住所を入力してください";
+        }
+        var execInput = editExecDate.Text.Trim();
+        if (string.IsNullOrWhiteSpace(execInput) ||
+            BusinessLogic.ParseFlexibleDate(execInput, eraMapping) == null)
+        {
+            editExecDate.BorderBrush = BrushError;
+            return "有効な執行日を入力してください";
+        }
+        return null;
+    }
+
+    // 届出住所のリアルタイムバリデーション（チェックON時のみ50文字制限表示）
+    private void ValidateEditDelivery()
+    {
+        if (editChkDelivery.IsChecked == true && !string.IsNullOrEmpty(editDelivery.Text))
+        {
+            int len = ("（届出：" + editDelivery.Text.Trim() + "）").Length;
+            if (len > 50)
+            {
+                editDeliveryError.Text = "50文字を超えています（現在: " + len + "文字）";
+                editDeliveryError.Visibility = Visibility.Visible;
+                return;
+            }
+        }
+        editDeliveryError.Visibility = Visibility.Collapsed;
+    }
+
+    // バリデーション → CSV 書き込み → 再読み込みを実行する
+    private void SaveEdit()
+    {
+        // バリデーション状態のリセット
+        editError.Text = "";
+        editDeliveryError.Visibility = Visibility.Collapsed;
+        editName.BorderBrush = BrushBorderNormal;
+        editStaff.BorderBrush = BrushBorderNormal;
+        editExecDate.BorderBrush = BrushBorderNormal;
+        editResidence.BorderBrush = BrushBorderNormal;
+
+        var errorMsg = ValidateEditFields();
+        if (errorMsg != null) { editError.Text = errorMsg; return; }
+
+        // 届出住所50文字チェック（チェックONの場合のみ）
+        if (editChkDelivery.IsChecked == true && !string.IsNullOrEmpty(editDelivery.Text))
+        {
+            string deliveryFull = "（届出：" + editDelivery.Text.Trim() + "）";
+            if (deliveryFull.Length > 50)
+            {
+                editDeliveryError.Text = "50文字を超えています（現在: " + deliveryFull.Length + "文字）";
+                editDeliveryError.Visibility = Visibility.Visible;
+                return;
+            }
+        }
+
+        if (editingRecord == null) return;
+
+        // 届出住所: チェックON →「（届出：...）」ラッパー付き / チェックOFF → 空文字
+        string deliveryAddr = (editChkDelivery.IsChecked == true && !string.IsNullOrEmpty(editDelivery.Text.Trim()))
+            ? "（届出：" + editDelivery.Text.Trim() + "）" : "";
+
+        // 執行日: TextBox の yyyy/MM/dd → CSV 保存用の7桁和暦に変換
+        var execDt = BusinessLogic.ParseFlexibleDate(editExecDate.Text.Trim(), eraMapping);
+        string execWareki = execDt.HasValue
+            ? BusinessLogic.DateToWareki(execDt.Value, eraMapping) : "";
+
+        string csvPath = isDepositTab ? depositCsvPath : insuranceCsvPath;
+        bool success = WriteEditedFields(csvPath, editingRecord.OriginalLineIndex,
+            editName.Text.Trim(),
+            editStaff.Text.Trim(),
+            execWareki,
+            editResidence.Text.Trim(),
+            deliveryAddr);
+
+        editingRecord = null;
+        editCalendarPopup.IsOpen = false;
+
+        FadeOut(editOverlay, delegate
+        {
+            if (success)
+            {
+                // CSV をディスクから再読み込み（他ユーザーの変更も反映）
+                if (isDepositTab && depositCsvPath != null)
+                    depositRecords = LoadCsvRecords(depositCsvPath, true);
+                else if (!isDepositTab && insuranceCsvPath != null)
+                    insuranceRecords = LoadCsvRecords(insuranceCsvPath, false);
+                PopulateTable();
+            }
+            else
+            {
+                MessageBox.Show(
+                    "CSV ファイルへの書き込みに失敗しました。\nファイルが他のプロセスで使用されている可能性があります。",
+                    "書き込みエラー", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+            dataTable.Focus();
+        });
+    }
+
+    // 指定行の編集対象フィールド（列[2]~[6]）を上書きする
+    // WriteWithdrawalFlags と同一のアトミック方式（FileShare.None ロック）
+    private bool WriteEditedFields(string csvPath, int targetLineIndex,
+        string name, string staff, string execDate, string residence, string delivery)
+    {
+        for (int retry = 1; retry <= CSV_WRITE_MAX_RETRY; retry++)
+        {
+            try
+            {
+                using (var fs = new FileStream(csvPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
+                {
+                    string[] lines;
+                    using (var reader = new StreamReader(fs, Encoding.UTF8, true, 4096, true))
+                    {
+                        var allText = reader.ReadToEnd();
+                        lines = allText.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+                    }
+
+                    if (targetLineIndex < lines.Length)
+                    {
+                        var fields = BusinessLogic.ParseCsvLine(lines[targetLineIndex]);
+                        if (fields.Length > EDIT_COL_DELIVERY)
+                        {
+                            fields[EDIT_COL_NAME]      = name;
+                            fields[EDIT_COL_STAFF]     = staff;
+                            fields[EDIT_COL_EXEC_DATE] = execDate;
+                            fields[EDIT_COL_RESIDENCE]  = residence;
+                            fields[EDIT_COL_DELIVERY]   = delivery;
+
+                            lines[targetLineIndex] = string.Join(",",
+                                fields.Select(f => BusinessLogic.CsvEscape(f)));
+                        }
+                    }
+
+                    fs.Seek(0, SeekOrigin.Begin);
+                    fs.SetLength(0);
+                    using (var writer = new StreamWriter(fs, new UTF8Encoding(true)))
+                    {
+                        for (int i = 0; i < lines.Length; i++)
+                        {
+                            if (i == lines.Length - 1 && string.IsNullOrEmpty(lines[i]))
+                                break;
+                            writer.WriteLine(lines[i]);
+                        }
+                        writer.Flush();
+                    }
+                }
+                return true;
+            }
+            catch
+            {
+                if (retry < CSV_WRITE_MAX_RETRY)
+                    System.Threading.Thread.Sleep(CSV_WRITE_RETRY_INTERVAL_MS);
+            }
+        }
+        return false;
+    }
+
+    // ==============================================================
     // オーバーレイアニメーション
     // ==============================================================
 
-    // 確認オーバーレイのフェードイン（Opacity 0→1）
-    private void FadeInOverlay()
+    // オーバーレイのフェードイン（Opacity 0→1）
+    private void FadeIn(Grid overlay)
     {
-        confirmOverlay.BeginAnimation(UIElement.OpacityProperty, null);
-        confirmOverlay.Opacity = 0;
-        confirmOverlay.Visibility = Visibility.Visible;
+        overlay.BeginAnimation(UIElement.OpacityProperty, null);
+        overlay.Opacity = 0;
+        overlay.Visibility = Visibility.Visible;
         var anim = new DoubleAnimation(0, 1, new Duration(TimeSpan.FromMilliseconds(150)));
-        confirmOverlay.BeginAnimation(UIElement.OpacityProperty, anim);
+        overlay.BeginAnimation(UIElement.OpacityProperty, anim);
     }
 
-    // 確認オーバーレイのフェードアウト（Opacity 1→0 → Collapsed）
-    private void FadeOutOverlay(Action onComplete = null)
+    // オーバーレイのフェードアウト（Opacity 1→0 → Collapsed）
+    private void FadeOut(Grid overlay, Action onComplete = null)
     {
         var anim = new DoubleAnimation(1, 0, new Duration(TimeSpan.FromMilliseconds(150)));
         anim.Completed += delegate
         {
-            confirmOverlay.BeginAnimation(UIElement.OpacityProperty, null);
-            confirmOverlay.Opacity = 1;
-            confirmOverlay.Visibility = Visibility.Collapsed;
+            overlay.BeginAnimation(UIElement.OpacityProperty, null);
+            overlay.Opacity = 1;
+            overlay.Visibility = Visibility.Collapsed;
             if (onComplete != null) onComplete();
         };
-        confirmOverlay.BeginAnimation(UIElement.OpacityProperty, anim);
+        overlay.BeginAnimation(UIElement.OpacityProperty, anim);
     }
 
     // ==============================================================
