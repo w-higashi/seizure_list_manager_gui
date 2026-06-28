@@ -1,0 +1,17 @@
+{
+  "_README": [
+    "【設定項目の解説】",
+    "",
+    "■ depositConfig（任意）",
+    "   deposit_seizure_list_config.json の絶対パス。",
+    "   設定すると、profiles[0].outputFolder から預金差押予定一覧.csv のパスを解決する。",
+    "   未設定または該当ファイルが存在しない場合、「預金」タブは無効化される。",
+    "",
+    "■ insuranceConfig（任意）",
+    "   insurance_seizure_list_config.json の絶対パス。",
+    "   設定すると、profiles[0].outputFolder から生命保険差押予定一覧.csv のパスを解決する。",
+    "   未設定または該当ファイルが存在しない場合、「生保」タブは無効化される。"
+  ],
+  "depositConfig": "D:\\Work\\Fuchu\\2026\\deposit_seizure_list_gui\\deposit_seizure_list_config.json",
+  "insuranceConfig": "D:\\Work\\Fuchu\\2026\\insurance_seizure_list_gui\\insurance_seizure_list_config.json"
+}
