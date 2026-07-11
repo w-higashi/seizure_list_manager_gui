@@ -58,6 +58,7 @@ public class CsvRecord
 
     public int OriginalLineIndex { get; set; }       // CSVファイル上の行番号（ヘッダー行含む）
     public bool IsWithdrawn { get; set; }             // 引抜済み（フラグ1 == "2"）
+    public bool IsPrinted { get; set; }               // 印刷済み（フラグ1 == "1"、WinActor 決裁用調書シナリオが設定）
     public string[] RawFields { get; set; }          // パース済み全フィールド（書き戻し用）
 }
 
@@ -411,6 +412,7 @@ public class SeizureListManagerApp : Application
     private TextBlock statusLeft, statusRight;
     private Grid confirmOverlay;
     private TextBlock confirmMessage, confirmSub;
+    private TextBlock confirmPrintWarning;                  // 引抜確認の印刷済み警告
 
     // --- 編集オーバーレイ UI要素 ---
     private Grid editOverlay;
@@ -420,6 +422,7 @@ public class SeizureListManagerApp : Application
     private Button editSave;
     private CheckBox editChkDelivery;
     private TextBlock editDeliveryError;
+    private TextBlock editPrintNotice;                      // 編集オーバーレイの印刷済み注意書き
     private Popup editCalendarPopup;
     private System.Windows.Controls.Calendar editCalendar;
 
@@ -576,6 +579,10 @@ public class SeizureListManagerApp : Application
     private List<CsvRecord> LoadCsvRecords(string csvPath, bool isDeposit)
     {
         var records = new List<CsvRecord>();
+
+        // .bak 残存チェック（前回の書き込みが未完了の場合は破損を診断し、復旧を案内する）
+        CheckAndOfferRecovery(csvPath, isDeposit ? D_MIN_COLUMNS : I_MIN_COLUMNS);
+
         if (!File.Exists(csvPath)) return records;
 
         string[] lines;
@@ -617,6 +624,7 @@ public class SeizureListManagerApp : Application
                 DocNumber       = fields[colDocNumber].Trim(),
                 OriginalLineIndex = i,
                 IsWithdrawn     = fields[colFlag1].Trim() == "2",
+                IsPrinted       = fields[colFlag1].Trim() == "1",
                 RawFields       = fields
             });
         }
@@ -629,15 +637,43 @@ public class SeizureListManagerApp : Application
     }
 
     // ==============================================================
-    // CSV 書き込み（引抜操作・アトミック方式）
+    // CSV 書き込み（バックアップ先行 + アトミック方式）
     // ==============================================================
 
     // 指定行の処理済フラグ1・2を「2」に設定する
-    // FileShare.None でロックしたまま読み込み→書き換え→書き戻しをアトミックに実行
     private bool WriteWithdrawalFlags(string csvPath, List<int> targetLineIndices, bool isDeposit)
     {
         int colFlag1 = isDeposit ? D_COL_FLAG1 : I_COL_FLAG1;
         int colFlag2 = isDeposit ? D_COL_FLAG2 : I_COL_FLAG2;
+
+        return WriteCsvWithBackup(csvPath, delegate(string[] lines)
+        {
+            // 対象行のフラグ書き換え（対象行のみ再構築、他の行はそのまま保持）
+            foreach (var lineIdx in targetLineIndices)
+            {
+                if (lineIdx >= lines.Length) continue;
+
+                var fields = BusinessLogic.ParseCsvLine(lines[lineIdx]);
+                if (fields.Length > colFlag1) fields[colFlag1] = "2";
+                if (fields.Length > colFlag2) fields[colFlag2] = "2";
+
+                lines[lineIdx] = string.Join(",",
+                    fields.Select(f => BusinessLogic.CsvEscape(f)));
+            }
+        });
+    }
+
+    // CSV 全体書き換えの共通コア（引抜操作・編集操作で共用）
+    // FileShare.None でロックしたまま「読み込み → .bak 書き出し → 書き換え → 書き戻し」を実行する。
+    // 書き戻し前に元の内容を .bak に保存するため、書き戻し中のクラッシュ・ネットワーク断で
+    // 本体が破損しても .bak から復旧できる（残存した .bak は CheckAndOfferRecovery が検出する）。
+    private bool WriteCsvWithBackup(string csvPath, Action<string[]> modifyLines)
+    {
+        string bakPath = csvPath + ".bak";
+
+        // 本体への書き戻しを開始したかどうか。開始後は外側のリトライ（再読み込み）を禁止する。
+        // 書き戻し中の失敗後に切り詰められた本体を読み直すと、健全な .bak を上書きしてしまうため
+        bool writeStarted = false;
 
         for (int retry = 1; retry <= CSV_WRITE_MAX_RETRY; retry++)
         {
@@ -653,42 +689,206 @@ public class SeizureListManagerApp : Application
                         lines = allText.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
                     }
 
-                    // 2. 対象行のフラグ書き換え（対象行のみ再構築、他の行はそのまま保持）
-                    foreach (var lineIdx in targetLineIndices)
+                    // 2. 元の内容を .bak に書き出し（本体破損時の復旧元）
+                    //    失敗時は例外で外側の catch に抜け、本体には手を付けずにリトライする
+                    using (var bakStream = new FileStream(bakPath, FileMode.Create, FileAccess.Write, FileShare.None))
                     {
-                        if (lineIdx >= lines.Length) continue;
-
-                        var fields = BusinessLogic.ParseCsvLine(lines[lineIdx]);
-                        if (fields.Length > colFlag1) fields[colFlag1] = "2";
-                        if (fields.Length > colFlag2) fields[colFlag2] = "2";
-
-                        lines[lineIdx] = string.Join(",",
-                            fields.Select(f => BusinessLogic.CsvEscape(f)));
+                        WriteLinesToStream(bakStream, lines);
                     }
 
-                    // 3. 先頭に戻して全行書き戻し
-                    fs.Seek(0, SeekOrigin.Begin);
-                    fs.SetLength(0);
-                    using (var writer = new StreamWriter(fs, new UTF8Encoding(true)))
+                    // 3. メモリ上で対象行を書き換え
+                    modifyLines(lines);
+
+                    // 4. 本体へ書き戻し
+                    //    途中失敗時はファイルを読み直さず、メモリ上の行データで書き込みのみ再試行する
+                    //    （切り詰められた本体を読み直して .bak を上書きする事故を防ぐ）
+                    writeStarted = true;
+                    bool written = false;
+                    for (int writeRetry = 1; writeRetry <= CSV_WRITE_MAX_RETRY; writeRetry++)
                     {
-                        for (int i = 0; i < lines.Length; i++)
+                        try
                         {
-                            if (i == lines.Length - 1 && string.IsNullOrEmpty(lines[i]))
-                                break;  // 末尾の空行は書き出さない
-                            writer.WriteLine(lines[i]);
+                            fs.Seek(0, SeekOrigin.Begin);
+                            fs.SetLength(0);
+                            WriteLinesToStream(fs, lines);
+                            written = true;
+                            break;
                         }
-                        writer.Flush();
+                        catch
+                        {
+                            if (writeRetry < CSV_WRITE_MAX_RETRY)
+                                System.Threading.Thread.Sleep(CSV_WRITE_RETRY_INTERVAL_MS);
+                        }
                     }
+
+                    // 書き戻し失敗: .bak を残したまま終了（次回読み込み時の復旧に使う）
+                    if (!written) return false;
                 }
+
+                // 5. 書き込み成功 → .bak を削除（.bak の残存 = 書き込み未完了のマーカー）
+                try { File.Delete(bakPath); } catch { }
                 return true;
             }
             catch
             {
+                // 書き戻し開始後に例外がここへ抜けた場合（Dispose 時の Flush 失敗等）は
+                // 再読み込みせずに終了し、.bak を保護する
+                if (writeStarted) return false;
+
+                // ロック競合など書き戻し開始前の失敗 → 再オープンからやり直し
                 if (retry < CSV_WRITE_MAX_RETRY)
                     System.Threading.Thread.Sleep(CSV_WRITE_RETRY_INTERVAL_MS);
             }
         }
         return false;
+    }
+
+    // 行配列を BOM 付き UTF-8 でストリームに書き出す（末尾の空行は書き出さない）
+    // ストリームは閉じない（呼び出し元の using で管理する）
+    private static void WriteLinesToStream(Stream stream, string[] lines)
+    {
+        using (var writer = new StreamWriter(stream, new UTF8Encoding(true), 4096, true))
+        {
+            for (int i = 0; i < lines.Length; i++)
+            {
+                if (i == lines.Length - 1 && string.IsNullOrEmpty(lines[i]))
+                    break;  // 末尾の空行は書き出さない
+                writer.WriteLine(lines[i]);
+            }
+            writer.Flush();
+        }
+    }
+
+    // ==============================================================
+    // CSV 復旧（.bak 残存時の破損診断と復旧提案）
+    // ==============================================================
+
+    // .bak が残存している場合、本体 CSV の破損を診断し、破損時のみ復旧ダイアログを表示する
+    // 本体が健全な場合は .bak を削除するだけで何も表示しない
+    // （.bak の残存 = 前回の WriteCsvWithBackup が書き戻しを完了できなかったことを示す）
+    private void CheckAndOfferRecovery(string csvPath, int minColumns)
+    {
+        string bakPath = csvPath + ".bak";
+        if (!File.Exists(bakPath)) return;
+
+        // .bak を読み込み（読めない場合は診断不能のため今回は見送る）
+        string[] bakLines;
+        try { bakLines = File.ReadAllLines(bakPath, Encoding.UTF8); }
+        catch { return; }
+
+        // 本体を読み込み（存在しない場合は「破損」扱い、ロック中は今回は見送る）
+        string[] mainLines = null;
+        bool mainReadable = false;
+        if (File.Exists(csvPath))
+        {
+            try { mainLines = File.ReadAllLines(csvPath, Encoding.UTF8); mainReadable = true; }
+            catch (IOException) { return; }
+        }
+
+        bool bakHealthy = IsCsvHealthy(bakLines, minColumns);
+
+        // 本体の破損診断:
+        // SetLength(0) 後の書き戻しは先頭から順次進むため、破損は必ず
+        // 「ファイル消失 / ヘッダー欠落 / 最終行の途切れ / 行数の減少」のいずれかの形をとる
+        bool mainCorrupt;
+        if (!mainReadable)
+        {
+            mainCorrupt = true;
+        }
+        else
+        {
+            mainCorrupt = !IsCsvHealthy(mainLines, minColumns);
+            if (!mainCorrupt && bakHealthy)
+            {
+                if (mainLines[0] != bakLines[0])
+                    mainCorrupt = true;  // ヘッダー不一致（ヘッダー途中で切れた痕跡）
+                else if (CountDataLines(mainLines) < CountDataLines(bakLines))
+                    mainCorrupt = true;  // 行数減少（書き込みは行数不変・他ツールは追記のみのため正常時は減らない）
+            }
+        }
+
+        // 本体が健全 → .bak は不要（書き戻し前のクラッシュ等）。黙って削除する
+        if (!mainCorrupt)
+        {
+            try { File.Delete(bakPath); } catch { }
+            return;
+        }
+
+        // 本体破損 + .bak も不健全 → 自動復旧は提案せず、警告のみ（両ファイルは保持）
+        if (!bakHealthy)
+        {
+            MessageBox.Show(
+                "CSV ファイルが破損している可能性がありますが、\nバックアップ（.bak）も不完全なため自動復旧できません。\n\n" +
+                "両方のファイルを保持しています。管理者に確認してください。\n\n" + csvPath,
+                "CSV 破損の警告", MessageBoxButton.OK, MessageBoxImage.Warning);
+            return;
+        }
+
+        // 本体破損 + .bak 健全 → 復旧ダイアログを表示する
+        int mainCount = mainReadable ? CountDataLines(mainLines) : 0;
+        int bakCount = CountDataLines(bakLines);
+        string mainTime = mainReadable
+            ? File.GetLastWriteTime(csvPath).ToString("yyyy/MM/dd HH:mm") : "—";
+        string bakTime = File.GetLastWriteTime(bakPath).ToString("yyyy/MM/dd HH:mm");
+        string fileName = System.IO.Path.GetFileName(csvPath);
+
+        var result = MessageBox.Show(
+            "前回の書き込みが正常に完了しなかった可能性があります。\n\n" +
+            "対象: " + fileName + "\n" +
+            "現在のファイル: " + mainCount + " 行（最終更新 " + mainTime + "）\n" +
+            "バックアップ: " + bakCount + " 行（最終更新 " + bakTime + "）\n\n" +
+            "バックアップから復旧しますか？\n\n" +
+            "はい: バックアップから復旧する\n" +
+            "いいえ: 現在のファイルをこのまま使う（バックアップを削除）\n" +
+            "キャンセル: 今は何もしない（両方のファイルを保持）",
+            "CSV 復旧の確認", MessageBoxButton.YesNoCancel, MessageBoxImage.Warning);
+
+        if (result == MessageBoxResult.Yes)
+        {
+            try
+            {
+                // コピー方式: コピー中にクラッシュしても .bak が無傷で残り、次回起動時に再試行できる
+                File.Copy(bakPath, csvPath, true);
+                File.Delete(bakPath);
+                MessageBox.Show("バックアップから復旧しました。", "CSV 復旧",
+                    MessageBoxButton.OK, MessageBoxImage.Information);
+            }
+            catch (Exception ex)
+            {
+                MessageBox.Show("復旧に失敗しました。バックアップは保持されます。\n\n" + ex.Message,
+                    "復旧エラー", MessageBoxButton.OK, MessageBoxImage.Error);
+            }
+        }
+        else if (result == MessageBoxResult.No)
+        {
+            try { File.Delete(bakPath); } catch { }
+        }
+        // キャンセル: 何もしない（.bak が残るため、次回の読み込み時に再度確認する）
+    }
+
+    // CSV の行配列が健全か判定する（ヘッダーが存在し、最終データ行が途中で切れていないこと）
+    private static bool IsCsvHealthy(string[] lines, int minColumns)
+    {
+        if (lines == null || lines.Length == 0) return false;
+        if (string.IsNullOrWhiteSpace(lines[0])) return false;  // ヘッダー欠落
+
+        // 最終非空行を末尾から探し、列数が揃っているか確認する
+        for (int i = lines.Length - 1; i >= 0; i--)
+        {
+            if (string.IsNullOrWhiteSpace(lines[i])) continue;
+            if (i == 0) return true;  // ヘッダーのみ（データ0行）は健全
+            return BusinessLogic.ParseCsvLine(lines[i]).Length >= minColumns;
+        }
+        return false;
+    }
+
+    // ヘッダーを除くデータ行数を数える（空行はカウントしない）
+    private static int CountDataLines(string[] lines)
+    {
+        int count = 0;
+        for (int i = 1; i < lines.Length; i++)
+            if (!string.IsNullOrWhiteSpace(lines[i])) count++;
+        return count;
     }
 
     // ==============================================================
@@ -997,6 +1197,28 @@ public class SeizureListManagerApp : Application
                                 </DataTemplate>
                             </GridViewColumn.CellTemplate>
                         </GridViewColumn>
+                        <GridViewColumn Width='42'>
+                            <GridViewColumn.Header>
+                                <GridViewColumnHeader Content='印刷'/>
+                            </GridViewColumn.Header>
+                            <GridViewColumn.CellTemplate>
+                                <DataTemplate>
+                                    <TextBlock Text='済' FontSize='12' FontWeight='Medium'
+                                               Foreground='#107C41'
+                                               HorizontalAlignment='Center'>
+                                        <TextBlock.Style>
+                                            <Style TargetType='TextBlock'>
+                                                <Setter Property='Visibility' Value='Collapsed'/>
+                                                <Style.Triggers>
+                                                    <DataTrigger Binding='{Binding IsPrinted}' Value='True'>
+                                                        <Setter Property='Visibility' Value='Visible'/></DataTrigger>
+                                                </Style.Triggers>
+                                            </Style>
+                                        </TextBlock.Style>
+                                    </TextBlock>
+                                </DataTemplate>
+                            </GridViewColumn.CellTemplate>
+                        </GridViewColumn>
                         <GridViewColumn Width='86'>
                             <GridViewColumn.Header>
                                 <GridViewColumnHeader Tag='登録日時' Content='登録日時'/>
@@ -1112,6 +1334,9 @@ public class SeizureListManagerApp : Application
                         <TextBlock x:Name='ConfirmSub' FontSize='11'
                                    Foreground='#777' Margin='0,0,0,20'
                                    Text='処理対象から除外されます'/>
+                        <TextBlock x:Name='ConfirmPrintWarning' FontSize='11'
+                                   Foreground='#D32F2F' Margin='0,-12,0,20'
+                                   TextWrapping='Wrap' Visibility='Collapsed'/>
                         <StackPanel Orientation='Horizontal'
                                     HorizontalAlignment='Right'>
                             <Button x:Name='ConfirmCancel' Content='キャンセル'
@@ -1155,6 +1380,10 @@ public class SeizureListManagerApp : Application
                             </Button>
                             <TextBlock Text='&#x270E; 登録内容の編集' FontSize='13' FontWeight='Medium'/>
                         </DockPanel>
+                        <TextBlock x:Name='EditPrintNotice' FontSize='11'
+                                   Foreground='#D32F2F' Margin='0,-6,0,10'
+                                   TextWrapping='Wrap' Visibility='Collapsed'
+                                   Text='この行は印刷済みです。修正後は再印刷が必要です。'/>
                         <!-- 読取専用フィールド: 宛名番号 + 金融機関名 -->
                         <Grid Margin='0,0,0,10'>
                             <Grid.ColumnDefinitions><ColumnDefinition Width='*'/><ColumnDefinition Width='16'/><ColumnDefinition Width='*'/></Grid.ColumnDefinitions>
@@ -1263,6 +1492,7 @@ public class SeizureListManagerApp : Application
         confirmOverlay  = (Grid)window.FindName("ConfirmOverlay");
         confirmMessage  = (TextBlock)window.FindName("ConfirmMessage");
         confirmSub      = (TextBlock)window.FindName("ConfirmSub");
+        confirmPrintWarning = (TextBlock)window.FindName("ConfirmPrintWarning");
         confirmCancel   = (Button)window.FindName("ConfirmCancel");
 
         // 編集オーバーレイ
@@ -1275,6 +1505,7 @@ public class SeizureListManagerApp : Application
         editDelivery    = (TextBox)window.FindName("EditDelivery");
         editChkDelivery = (CheckBox)window.FindName("EditChkDelivery");
         editDeliveryError = (TextBlock)window.FindName("EditDeliveryError");
+        editPrintNotice = (TextBlock)window.FindName("EditPrintNotice");
         editExecDate    = (TextBox)window.FindName("EditExecDate");
         editError       = (TextBlock)window.FindName("EditError");
         editSave        = (Button)window.FindName("EditSaveButton");
@@ -1652,21 +1883,21 @@ public class SeizureListManagerApp : Application
     private void AdjustColumnWidths()
     {
         var gridView = dataTable.View as GridView;
-        if (gridView == null || gridView.Columns.Count < 9) return;
+        if (gridView == null || gridView.Columns.Count < 10) return;
 
         // 生保タブでは支店名列を非表示、金融機関名列を拡大（保険会社名が長いため）
         double branchWidth = isDepositTab ? 120 : 0;
         double institutionWidth = isDepositTab ? 130 : 200;
-        gridView.Columns[6].Width = institutionWidth;  // 金融機関名列
-        gridView.Columns[7].Width = branchWidth;       // 支店名列
+        gridView.Columns[7].Width = institutionWidth;  // 金融機関名列
+        gridView.Columns[8].Width = branchWidth;       // 支店名列
 
         double totalWidth = dataTable.ActualWidth - SystemParameters.VerticalScrollBarWidth - 4;
-        // 引抜(42) + 登録日時(86) + 宛名番号(82) + 処分担当(96) + 執行日(104) + 金融機関名(130/200) + 支店名(120/0) + 文書番号(78)
-        double fixedWidth = 42 + 86 + 82 + 96 + 104 + institutionWidth + branchWidth + 78;
+        // 引抜(42) + 印刷(42) + 登録日時(86) + 宛名番号(82) + 処分担当(96) + 執行日(104) + 金融機関名(130/200) + 支店名(120/0) + 文書番号(78)
+        double fixedWidth = 42 + 42 + 86 + 82 + 96 + 104 + institutionWidth + branchWidth + 78;
         double remaining = totalWidth - fixedWidth;
         if (remaining < 80) remaining = 80;
 
-        gridView.Columns[3].Width = remaining;  // 氏名列（可変幅）
+        gridView.Columns[4].Width = remaining;  // 氏名列（可変幅）
     }
 
     // ==============================================================
@@ -1718,6 +1949,20 @@ public class SeizureListManagerApp : Application
         else
             confirmMessage.Text = targets.Count + " 件の登録を引き抜きます";
 
+        // 印刷済み（フラグ1=1）の行が含まれる場合は警告を表示する
+        int printedCount = targets.Count(r => r.IsPrinted);
+        if (printedCount > 0)
+        {
+            confirmPrintWarning.Text = (targets.Count == 1)
+                ? "この行は印刷済みです。引抜後、担当職員へ連絡してください。"
+                : printedCount + " 件は印刷済みです。引抜後、担当職員へ連絡してください。";
+            confirmPrintWarning.Visibility = Visibility.Visible;
+        }
+        else
+        {
+            confirmPrintWarning.Visibility = Visibility.Collapsed;
+        }
+
         FadeIn(confirmOverlay);
         confirmCancel.Focus();
     }
@@ -1752,7 +1997,8 @@ public class SeizureListManagerApp : Application
             else
             {
                 MessageBox.Show(
-                    "CSV ファイルへの書き込みに失敗しました。\nファイルが他のプロセスで使用されている可能性があります。",
+                    "CSV ファイルへの書き込みに失敗しました。\nファイルが他のプロセスで使用されている可能性があります。\n\n" +
+                    "書き込みが途中で失敗した場合はバックアップ（.bak）が残っており、\n次回の読み込み時に復旧を確認します。",
                     "書き込みエラー", MessageBoxButton.OK, MessageBoxImage.Error);
             }
             // ボタンからフォーカスを外し、Enter 連打での再発火を防止
@@ -1795,6 +2041,10 @@ public class SeizureListManagerApp : Application
             editChkDelivery.IsChecked = !string.IsNullOrEmpty(rawDelivery);
         }
         editDeliveryError.Visibility = Visibility.Collapsed;
+
+        // 印刷済み（フラグ1=1）の行には注意書きを表示する
+        editPrintNotice.Visibility = editingRecord.IsPrinted
+            ? Visibility.Visible : Visibility.Collapsed;
 
         // 執行日: 7桁和暦 → yyyy/MM/dd に変換して表示
         var rawExec = fields.Length > EDIT_COL_EXEC_DATE ? fields[EDIT_COL_EXEC_DATE].Trim() : "";
@@ -1926,7 +2176,8 @@ public class SeizureListManagerApp : Application
             else
             {
                 MessageBox.Show(
-                    "CSV ファイルへの書き込みに失敗しました。\nファイルが他のプロセスで使用されている可能性があります。",
+                    "CSV ファイルへの書き込みに失敗しました。\nファイルが他のプロセスで使用されている可能性があります。\n\n" +
+                    "書き込みが途中で失敗した場合はバックアップ（.bak）が残っており、\n次回の読み込み時に復旧を確認します。",
                     "書き込みエラー", MessageBoxButton.OK, MessageBoxImage.Error);
             }
             dataTable.Focus();
@@ -1934,61 +2185,26 @@ public class SeizureListManagerApp : Application
     }
 
     // 指定行の編集対象フィールド（列[2]~[6]）を上書きする
-    // WriteWithdrawalFlags と同一のアトミック方式（FileShare.None ロック）
+    // WriteWithdrawalFlags と同一のバックアップ先行 + アトミック方式（WriteCsvWithBackup を共用）
     private bool WriteEditedFields(string csvPath, int targetLineIndex,
         string name, string staff, string execDate, string residence, string delivery)
     {
-        for (int retry = 1; retry <= CSV_WRITE_MAX_RETRY; retry++)
+        return WriteCsvWithBackup(csvPath, delegate(string[] lines)
         {
-            try
-            {
-                using (var fs = new FileStream(csvPath, FileMode.Open, FileAccess.ReadWrite, FileShare.None))
-                {
-                    string[] lines;
-                    using (var reader = new StreamReader(fs, Encoding.UTF8, true, 4096, true))
-                    {
-                        var allText = reader.ReadToEnd();
-                        lines = allText.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
-                    }
+            if (targetLineIndex >= lines.Length) return;
 
-                    if (targetLineIndex < lines.Length)
-                    {
-                        var fields = BusinessLogic.ParseCsvLine(lines[targetLineIndex]);
-                        if (fields.Length > EDIT_COL_DELIVERY)
-                        {
-                            fields[EDIT_COL_NAME]      = name;
-                            fields[EDIT_COL_STAFF]     = staff;
-                            fields[EDIT_COL_EXEC_DATE] = execDate;
-                            fields[EDIT_COL_RESIDENCE]  = residence;
-                            fields[EDIT_COL_DELIVERY]   = delivery;
+            var fields = BusinessLogic.ParseCsvLine(lines[targetLineIndex]);
+            if (fields.Length <= EDIT_COL_DELIVERY) return;
 
-                            lines[targetLineIndex] = string.Join(",",
-                                fields.Select(f => BusinessLogic.CsvEscape(f)));
-                        }
-                    }
+            fields[EDIT_COL_NAME]      = name;
+            fields[EDIT_COL_STAFF]     = staff;
+            fields[EDIT_COL_EXEC_DATE] = execDate;
+            fields[EDIT_COL_RESIDENCE]  = residence;
+            fields[EDIT_COL_DELIVERY]   = delivery;
 
-                    fs.Seek(0, SeekOrigin.Begin);
-                    fs.SetLength(0);
-                    using (var writer = new StreamWriter(fs, new UTF8Encoding(true)))
-                    {
-                        for (int i = 0; i < lines.Length; i++)
-                        {
-                            if (i == lines.Length - 1 && string.IsNullOrEmpty(lines[i]))
-                                break;
-                            writer.WriteLine(lines[i]);
-                        }
-                        writer.Flush();
-                    }
-                }
-                return true;
-            }
-            catch
-            {
-                if (retry < CSV_WRITE_MAX_RETRY)
-                    System.Threading.Thread.Sleep(CSV_WRITE_RETRY_INTERVAL_MS);
-            }
-        }
-        return false;
+            lines[targetLineIndex] = string.Join(",",
+                fields.Select(f => BusinessLogic.CsvEscape(f)));
+        });
     }
 
     // ==============================================================
