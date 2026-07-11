@@ -374,6 +374,7 @@ public class SeizureListManagerApp : Application
     private string currentSortColumn = "文書番号";          // 現在のソート列
     private bool currentSortAsc = false;                   // 昇順ソートか
     private bool hideWithdrawn = false;                    // 引抜済み非表示トグル
+    private bool hidePrinted = false;                      // 印刷済み非表示トグル
     private System.Windows.Threading.DispatcherTimer filterTimer;  // 即時フィルタのデバウンス用
     private CsvRecord editingRecord = null;                // 編集中のレコード（null=未編集）
 
@@ -407,6 +408,7 @@ public class SeizureListManagerApp : Application
     private TextBox searchBox;
     private ComboBox columnCombo;
     private CheckBox toggleWithdrawn;
+    private CheckBox togglePrinted;
     private ListView dataTable;
     private Button btnWithdraw, btnEdit, btnReload, btnClear, confirmCancel;
     private TextBlock statusLeft, statusRight;
@@ -1162,9 +1164,14 @@ public class SeizureListManagerApp : Application
                         Margin='0,0,8,0'>
                     <TextBlock Text='&#x270E; 編集' VerticalAlignment='Center'/>
                 </Button>
-                <CheckBox x:Name='ToggleWithdrawn'
+                <CheckBox x:Name='ToggleWithdrawn' DockPanel.Dock='Left'
                           Content='引抜済みを非表示' FontSize='11'
-                          Foreground='#777' VerticalContentAlignment='Center'/>
+                          Foreground='#777' VerticalContentAlignment='Center'
+                          Margin='0,0,16,0'/>
+                <CheckBox x:Name='TogglePrinted'
+                          Content='印刷済みを非表示' FontSize='11'
+                          Foreground='#777' VerticalContentAlignment='Center'
+                          HorizontalAlignment='Left'/>
             </DockPanel>
         </Border>
 
@@ -1482,6 +1489,7 @@ public class SeizureListManagerApp : Application
         searchBox       = (TextBox)window.FindName("SearchBox");
         columnCombo     = (ComboBox)window.FindName("ColumnCombo");
         toggleWithdrawn = (CheckBox)window.FindName("ToggleWithdrawn");
+        togglePrinted   = (CheckBox)window.FindName("TogglePrinted");
         dataTable       = (ListView)window.FindName("DataTable");
         btnWithdraw     = (Button)window.FindName("WithdrawButton");
         btnEdit         = (Button)window.FindName("EditButton");
@@ -1550,6 +1558,8 @@ public class SeizureListManagerApp : Application
         // 引抜済み非表示トグル
         toggleWithdrawn.Checked += delegate { hideWithdrawn = true; PopulateTable(); };
         toggleWithdrawn.Unchecked += delegate { hideWithdrawn = false; PopulateTable(); };
+        togglePrinted.Checked += delegate { hidePrinted = true; PopulateTable(); };
+        togglePrinted.Unchecked += delegate { hidePrinted = false; PopulateTable(); };
 
         // テーブル選択変更
         dataTable.SelectionChanged += delegate { UpdateButtonState(); };
@@ -1791,6 +1801,9 @@ public class SeizureListManagerApp : Application
         {
             // 引抜済み非表示
             if (hideWithdrawn && rec.IsWithdrawn) continue;
+
+            // 印刷済み非表示
+            if (hidePrinted && rec.IsPrinted) continue;
 
             // テキストフィルタ
             if (!string.IsNullOrEmpty(query))
@@ -2265,9 +2278,12 @@ public class SeizureListManagerApp : Application
         var allRecords = GetCurrentRecords();
         int total = allRecords.Count;
         int withdrawn = allRecords.Count(r => r.IsWithdrawn);
+        int printed = allRecords.Count(r => r.IsPrinted);
         int displayed = dataTable.Items.Count;
 
-        statusLeft.Text = displayed + " 件 / " + total + " 件中（引抜済み: " + withdrawn + " 件）";
+        // 引抜済み（フラグ1=2）と印刷済み（フラグ1=1）は排他のため、内訳は重複しない
+        statusLeft.Text = displayed + " 件 / " + total +
+            " 件中（引抜済み: " + withdrawn + " 件・印刷済み: " + printed + " 件）";
 
         string path = isDepositTab ? depositCsvPath : insuranceCsvPath;
         statusRight.Text = path ?? "";
